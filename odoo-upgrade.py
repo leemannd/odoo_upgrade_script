@@ -1,5 +1,3 @@
-# https://upgrade.odoo.com/upgrade
-
 #!/usr/bin/env python
 import re
 import argparse
@@ -20,6 +18,7 @@ except ImportError:
 import time
 import os
 import shutil
+import hashlib
 from datetime import datetime, timedelta
 from operator import itemgetter
 
@@ -837,6 +836,11 @@ def parse_command_line():
             help="The name of a database to dump and upgrade",
         )
         subparser.add_argument(
+            "-r",
+            "--restore-name",
+            help="The name of database into which the upgraded dump must be restored",
+        )
+        subparser.add_argument(
             "-i",
             "--dump",
             help="The database dump to upgrade (.sql, .dump, .sql.gz, .zip or a psql dump directory with %s file)"
@@ -1002,7 +1006,9 @@ def get_env_vars(env_vars, env_file):
     return env_vars
 
 
-def process_upgrade_command(dbname, dump, contract, target, aim, env_vars):
+def process_upgrade_command(
+    dbname, upgraded_db_name, dump, contract, target, aim, env_vars
+):
     if dbname and dump:
         raise UpgradeError(
             "You cannot upgrade a database and a dump file at the same time"
@@ -1022,13 +1028,18 @@ def process_upgrade_command(dbname, dump, contract, target, aim, env_vars):
             {
                 "input_source": "db",
                 "dbname": dbname,
-                "upgraded_db_name": get_upgraded_db_name(dbname, target, aim),
+                "upgraded_db_name": upgraded_db_name
+                if upgraded_db_name
+                else get_upgraded_db_name(dbname, target, aim),
                 "token_name": token_name,
             }
         )
 
     # update the context when a dump is upgraded
     if dump:
+        if not os.path.exists(dump):
+            raise UpgradeError("Dump %r not found." % dump)
+
         dump_absolute_path = os.path.abspath(dump)
         dump_basename, dump_ext = get_dump_basename_and_format(dump)
         if dump_ext is None or (
@@ -1048,7 +1059,7 @@ def process_upgrade_command(dbname, dump, contract, target, aim, env_vars):
                 "The zip dump archive is not valid (either corrupted or does not contain, at least, a dump.sql file)"
             )
 
-        token_name = "dump_%s%s" % (dump_basename, dump_ext)
+        token_name = get_token_name(dump_absolute_path)
         additional_context.update(
             {
                 "input_source": "dump",
@@ -1082,6 +1093,25 @@ def process_upgrade_command(dbname, dump, contract, target, aim, env_vars):
     if dbname:
         clean_dump(get_dump_name(dbname))
     remove_saved_token(token_name, target, aim)
+
+
+def get_token_name(dump_absolute_path):
+    input_file = (
+        os.path.join(dump_absolute_path, "toc.dat")
+        if os.path.isdir(dump_absolute_path)
+        else dump_absolute_path
+    )
+
+    heuristics = (
+        input_file,
+        os.path.getsize(input_file),
+        os.path.getctime(input_file),
+        os.getuid(),
+    )
+    sha = hashlib.sha256()
+    for heuristic in heuristics:
+        sha.update(str(heuristic).encode() + b"\x1e")
+    return "dump_%s" % sha.hexdigest()
 
 
 def process_restore_command(token, dbname, aim, restored_name):
@@ -1180,6 +1210,7 @@ def main():
             env_vars = get_env_vars(args.env, args.env_file)
             process_upgrade_command(
                 args.dbname,
+                args.restore_name,
                 args.dump,
                 args.contract,
                 args.target,
@@ -1206,4 +1237,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
