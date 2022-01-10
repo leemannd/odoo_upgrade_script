@@ -6,6 +6,8 @@ Link to download: https://upgrade.odoo.com/upgrade
 Sample command given by Odoo to interact with them
 ```python <(curl -s https://upgrade.odoo.com/upgrade) test -d <your db name> -t <target version>```
 
+To download the script: wget https://upgrade.odoo.com/upgrade -O odoo-upgrade.py
+
 
 ## Goals
 
