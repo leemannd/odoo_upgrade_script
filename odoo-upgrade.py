@@ -7,6 +7,7 @@ import json
 import socket
 import tempfile
 import sys
+import gzip
 import zipfile
 import ssl
 
@@ -420,6 +421,15 @@ def is_zip_dump_valid(dump_file):
                 if not ("dump.sql" in zipf.namelist()):
                     return False
     except Exception:
+        return False
+    return True
+
+
+def is_gz_dump_valid(dump_path):
+    try:
+        with gzip.open(dump_path) as f:
+            f.read(2)
+    except IOError:
         return False
     return True
 
@@ -1058,6 +1068,11 @@ def process_upgrade_command(
             raise UpgradeError(
                 "The zip dump archive is not valid (either corrupted or does not contain, at least, a dump.sql file)"
             )
+        if dump_ext == ".sql.gz" and not is_gz_dump_valid(dump):
+            raise UpgradeError(
+                "The dump %r is not valid (either corrupted or has the wrong extension)"
+                % dump
+            )
 
         token_name = get_token_name(dump_absolute_path)
         additional_context.update(
@@ -1125,6 +1140,7 @@ def process_restore_command(token, dbname, aim, restored_name):
                 "dbname": dbname,
                 "upgraded_db_name": restored_name,
                 "no_restore": False,
+                "input_source": None,
             },
         )
 
@@ -1145,7 +1161,7 @@ def process_log_command(token, from_byte):
 def main():
     args = parse_command_line()
 
-    if args.dump:
+    if "dump" in args and args.dump:
         dump_absolute_path = os.path.abspath(args.dump)
 
         """
