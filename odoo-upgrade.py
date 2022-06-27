@@ -921,7 +921,13 @@ def parse_command_line():
             "-t", "--token", required=True, help="The token ID of the request"
         )
 
-    parser = argparse.ArgumentParser()
+    prog = (
+        "python <(curl -s https://upgrade.odoo.com/upgrade)"
+        if not os.path.isfile(sys.argv[0])
+        else None
+    )
+
+    parser = argparse.ArgumentParser(prog=prog)
 
     parser.add_argument("--debug", action="store_true", help="activate debug traces")
 
