@@ -1,25 +1,26 @@
 #!/usr/bin/env python
-import re
 import argparse
-import subprocess
-import logging
-import json
-import socket
-import tempfile
-import sys
+import getpass
 import gzip
-import zipfile
+import json
+import logging
+import re
+import socket
 import ssl
+import subprocess
+import sys
+import tempfile
+import zipfile
 
 try:
     import urllib.request as urlrequest
 except ImportError:
     import urllib2 as urlrequest
 
-import time
+import hashlib
 import os
 import shutil
-import hashlib
+import time
 from datetime import datetime, timedelta
 from operator import itemgetter
 
@@ -521,11 +522,14 @@ def create_upgrade_request(contract, target, aim, env_vars, ssh_key):
             "actuator": "cli",
             "env_vars": env_vars,
             "ssh_key": open(ssh_key).read(),
+            "api_version": "0.2",
         },
     )
 
-    check_response_format(response, ("request_id", "token"))
-
+    check_response_format(response, ("request_id", "token", "assigned_host_uri"))
+    if response.get("info"):
+        logging.warning(response["info"])
+    logging.info("Assigned host's server uri '%s'", response["assigned_host_uri"])
     logging.info("The secret token is '%s'", response["token"])
     return response
 
@@ -588,9 +592,15 @@ def get_request_status(token):
     Request the request processing status and an optional reason
     """
     response = send_json_request("upgrade/request/status", {"token": token})
-    check_response_format(response, ("status",))
+    check_response_format(
+        response,
+        (
+            "status",
+            "host_uri",
+        ),
+    )
 
-    return response["status"], response.get("reason")
+    return response["status"], response["host_uri"], response.get("reason")
 
 
 # ---------------------------------------------------------------------------------
@@ -615,7 +625,7 @@ def init_handler(fsm):
     if ssh_key == DEFAULT_SSH_KEY_NAME:
         generate_default_ssh_keys()
 
-    request = create_upgrade_request(
+    response = create_upgrade_request(
         contract, target, aim, env_vars, "%s.pub" % ssh_key
     )
 
@@ -623,9 +633,13 @@ def init_handler(fsm):
         dump_database(dbname, get_dump_name(dbname), core_count)
 
     # store the token in a file to be able to resume the request in case of interruption
-    save_token(token_name, target, aim, request["token"])
+    save_token(token_name, target, aim, response["token"])
 
-    fsm.update_context(request)
+    # make sure that the request is resumed from the correct node
+    set_upgrade_and_data_server_names(response["assigned_host_uri"])
+    fsm.update_context({"data_server_name": DATA_SERVER_NAME})
+
+    fsm.update_context(response)
     return "new"
 
 
@@ -810,7 +824,7 @@ def monitor_request_processing(token):
     """
     Monitor the request processing status and display logs at the same time
     """
-    status, reason = get_request_status(token)
+    status, host_uri, reason = get_request_status(token)
     displayed_log_bytes = 0
     last_check_time = datetime.now()
 
@@ -819,7 +833,7 @@ def monitor_request_processing(token):
         if datetime.now() > last_check_time + timedelta(
             seconds=STATUS_MONITORING_PERIOD
         ):
-            status, reason = get_request_status(token)
+            status, host_uri, reason = get_request_status(token)
             last_check_time = datetime.now()
 
         # logs streaming
@@ -1022,6 +1036,12 @@ def get_env_vars(env_vars, env_file):
     return env_vars
 
 
+def set_upgrade_and_data_server_names(host_uri):
+    global UPGRADE_SERVER_NAME, DATA_SERVER_NAME
+    UPGRADE_SERVER_NAME = "https://" + host_uri
+    DATA_SERVER_NAME = host_uri
+
+
 def process_upgrade_command(
     dbname, upgraded_db_name, dump, contract, target, aim, env_vars
 ):
@@ -1102,8 +1122,12 @@ def process_upgrade_command(
         if user_confirm():
             logging.info("Resuming the upgrade request")
 
-            start_state, reason = get_request_status(saved_token)
+            start_state, host_uri, reason = get_request_status(saved_token)
             additional_context.update({"token": saved_token, "reason": reason})
+
+            # make sure that the request is resumed from the correct node
+            set_upgrade_and_data_server_names(host_uri)
+            fsm.update_context({"data_server_name": DATA_SERVER_NAME})
         else:
             logging.info("Restarting the upgrade request from the beginning")
 
@@ -1123,11 +1147,16 @@ def get_token_name(dump_absolute_path):
         else dump_absolute_path
     )
 
+    try:
+        uname = getpass.getuser()
+    except Exception:
+        uname = ""
+
     heuristics = (
         input_file,
         os.path.getsize(input_file),
         os.path.getctime(input_file),
-        os.getuid(),
+        uname,
     )
     sha = hashlib.sha256()
     for heuristic in heuristics:
@@ -1136,7 +1165,7 @@ def get_token_name(dump_absolute_path):
 
 
 def process_restore_command(token, dbname, aim, restored_name):
-    status, _ = get_request_status(token)
+    status = get_request_status(token)[0]
     if status == "done":
         fsm.run(
             "done",
@@ -1152,7 +1181,7 @@ def process_restore_command(token, dbname, aim, restored_name):
 
 
 def process_status_command(token):
-    status, reason = get_request_status(token)
+    status, _, reason = get_request_status(token)
     logging.info(
         "Request status: %s%s", status.upper(), " (%s)" % reason if reason else ""
     )
