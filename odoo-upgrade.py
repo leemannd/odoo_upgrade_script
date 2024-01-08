@@ -334,6 +334,13 @@ def restore_filestore(origin_db_name, upgraded_db_name):
     as the upgraded database.
     If the previous filestore is not found, the new filestore should be restored manually.
     """
+    if not origin_db_name:
+        logging.warning(
+            "The original filestore location could not be determined."
+            " The filestore of the upgrade database should be restored manually."
+        )
+        return
+
     origin_fs_path = os.path.join(FILESTORE_PATH, origin_db_name)
 
     if os.path.exists(origin_fs_path):
@@ -344,12 +351,12 @@ def restore_filestore(origin_db_name, upgraded_db_name):
         run_command(["rsync", "-a", FILESTORE_NAME + os.sep, new_fs_path])
         shutil.rmtree(FILESTORE_NAME)
     else:
-        logging.info(
-            "The original filestore of '%s' has not been found in %s.",
+        logging.warning(
+            "The original filestore of '%s' has not been found in %s. "
+            "The filestore of the upgrade database should be restored manually.",
             origin_db_name,
             FILESTORE_PATH,
         )
-        logging.info("In consequence, the filestore of the upgrade database should be restored manually.")
 
 
 def clean_dump(dump_name):
@@ -360,7 +367,7 @@ def clean_dump(dump_name):
         os.remove(dump_name)
 
 
-def get_db_contract(dbname):
+def get_db_contract(dbname, fallback_contract=None):
     try:
         output = subprocess.check_output(
             [
@@ -378,9 +385,14 @@ def get_db_contract(dbname):
     except Exception:
         pass
 
+    if fallback_contract:
+        logging.info("No subscription code found in the database. Fallback to the one given on CLI")
+        return fallback_contract
+
     raise UpgradeError(
         "Unable to get the subscription code of your database. Your database must be registered to be "
-        "eligible for an upgrade. See https://www.odoo.com/documentation/user/db_management/db_premise.html"
+        "eligible for an upgrade. See https://www.odoo.com/documentation/user/db_management/db_premise.html for more info. "
+        "Alternatively, you can specify the subscription code using the `--contract` argument."
     )
 
 
@@ -613,8 +625,13 @@ def init_handler(fsm):
     )
 
     if input_source == "db":
-        dbname, token_name = fsm.get_context_data(("dbname", "token_name"))
-        contract = get_db_contract(dbname)
+        dbname, token_name, cli_contract = fsm.get_context_data(("dbname", "token_name", "contract"))
+        contract = get_db_contract(dbname, cli_contract)
+        if cli_contract and contract != cli_contract:
+            logging.warning(
+                "The subscription code found in the database differs from the one provided as `--contract` parameter. "
+                "Continuing with the contract found in the database."
+            )
     else:
         contract, token_name = fsm.get_context_data(("contract", "token_name"))
 
@@ -720,10 +737,12 @@ def cancelled_handler(fsm):
 
 
 def done_handler(fsm):
-    input_source, token, ssh_key, core_count, aim = fsm.get_context_data(
-        ("input_source", "token", "ssh_key", "core_count", "aim")
-    )
     (
+        input_source,
+        token,
+        ssh_key,
+        core_count,
+        aim,
         data_server_name,
         data_server_user,
         data_server_path,
@@ -731,6 +750,11 @@ def done_handler(fsm):
         dump_dest_path,
     ) = fsm.get_context_data(
         (
+            "input_source",
+            "token",
+            "ssh_key",
+            "core_count",
+            "aim",
             "data_server_name",
             "data_server_user",
             "data_server_path",
@@ -752,7 +776,13 @@ def done_handler(fsm):
     )
     stop_transfer(token)
 
-    if not no_restore:
+    if no_restore:
+        logging.info(
+            "The upgraded database and filestore have been downloaded as %s.\n"
+            "Skipping the restore of the upgraded dump and the merge of the filestore.",
+            info["dump_name"],
+        )
+    else:
         upgraded_db_name = fsm.get_context_data(("upgraded_db_name",))
         db_name = fsm.get_context_data(("dbname",)) if input_source == "db" else None
 
@@ -863,7 +893,7 @@ def parse_command_line():
         subparser.add_argument(
             "-c",
             "--contract",
-            help="The contract number associated to the database (to use with --dump only)",
+            help="The contract number associated to the database (by default taken from the DB if it already has one, mandatory when sending a dump file with --dump)",
         )
         subparser.add_argument("-t", "--target", required=True, help="The upgraded database version")
         subparser.add_argument(
@@ -944,6 +974,7 @@ def parse_command_line():
 
     # sub-parser for the 'restore' command
     parser_restore = subparsers.add_parser("restore", help="download and restore the upgraded database")
+    add_pg_arguments(parser_restore)
     add_token_argument(parser_restore)
     parser_restore.add_argument(
         "-d",
@@ -1018,6 +1049,7 @@ def process_upgrade_command(dbname, upgraded_db_name, dump, contract, target, ai
     additional_context = {
         "target": target,
         "aim": aim,
+        "contract": contract,
         "env_vars": env_vars,
     }
 
@@ -1064,7 +1096,6 @@ def process_upgrade_command(dbname, upgraded_db_name, dump, contract, target, ai
                 "token_name": token_name,
                 "dump_basename": dump_basename,
                 "dump_ext": dump_ext,
-                "contract": contract,
                 "no_restore": True,
             }
         )
@@ -1129,7 +1160,6 @@ def process_restore_command(token, dbname, aim, restored_name):
                 "aim": aim,
                 "dbname": dbname,
                 "upgraded_db_name": restored_name,
-                "no_restore": False,
                 "input_source": None,
             },
         )
@@ -1191,28 +1221,22 @@ def main():
         }
     )
 
+    # handle parameters specific to some commands
+    if args.command in ("test", "production", "restore"):
+        fsm.update_context(
+            {
+                "ssh_key": args.ssh_key,
+                "core_count": args.core_count,
+                "data_server_name": args.data_server_name,
+                "data_server_user": args.data_server_user,
+                "data_server_path": args.data_server_path,
+                "host_dump_upload_path": host_dump_upload_path,
+                "host_dump_download_path": host_dump_download_path,
+                "no_restore": args.no_restore,
+            }
+        )
+
     try:
-        # handle parameters specific to some commands
-        if args.command in ("test", "production", "restore"):
-            fsm.update_context(
-                {
-                    "ssh_key": args.ssh_key,
-                    "core_count": args.core_count,
-                    "data_server_name": args.data_server_name,
-                    "data_server_user": args.data_server_user,
-                    "data_server_path": args.data_server_path,
-                    "host_dump_upload_path": host_dump_upload_path,
-                    "host_dump_download_path": host_dump_download_path,
-                }
-            )
-
-        if args.command in ("test", "production"):
-            fsm.update_context(
-                {
-                    "no_restore": args.no_restore,
-                }
-            )
-
         if args.command in ("test", "production"):
             env_vars = get_env_vars(args.env, args.env_file)
             process_upgrade_command(
