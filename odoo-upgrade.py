@@ -58,8 +58,6 @@ ssl_context = ssl.create_default_context() if SSL_VERIFICATION else ssl._create_
 class UpgradeError(Exception):
     """Generic exception to handled any kind of upgrade errors in a same way"""
 
-    pass
-
 
 class StateMachine:
     """
@@ -67,7 +65,7 @@ class StateMachine:
     * A state machine has a specific context (internal data) which may be updated with `update_context`.
     Each handler may access to the context using the `get_context_data` method.
     * States are defined using the `set_states` method, with a name and a handler.
-    * A handler executes all the processing for a specific state and returns the next state to execute or None if
+    * A handler executes all the processing for a specific state and returns the next state to execute or "terminal" if
     it's a terminal state.
     * The `run` method starts the state machine execution from a specific state with an optional additional context,
     until a terminal state.
@@ -115,11 +113,11 @@ class StateMachine:
             raise StateMachine.Error("The state '%s' is not a valid state." % from_state)
 
         if additional_context is not None:
-            self.context.update(additional_context)
+            self.update_context(additional_context)
 
         self.current_state = from_state
 
-        while self.current_state is not None:
+        while self.current_state in self.handlers:
             handler = self.handlers[self.current_state]
             self.current_state = handler(self)
 
@@ -148,7 +146,7 @@ def run_command(command, stream_output=False):
     except subprocess.CalledProcessError as e:
         error_msg = "The '%s' command has failed" % e.cmd[0]
         if not stream_output:
-            error_msg += " with the following output:\n %s" % e.output.decode("utf-8").rstrip("\n")
+            error_msg += " with the following output:\n %s" % e.output.decode("utf-8", "replace").rstrip("\n")
     raise UpgradeError(error_msg)
 
 
@@ -391,7 +389,7 @@ def get_db_contract(dbname, fallback_contract=None):
 
     raise UpgradeError(
         "Unable to get the subscription code of your database. Your database must be registered to be "
-        "eligible for an upgrade. See https://www.odoo.com/documentation/user/db_management/db_premise.html for more info. "
+        "eligible for an upgrade. See https://www.odoo.com/documentation/user/administration/maintain/on_premise.html for more info. "
         "Alternatively, you can specify the subscription code using the `--contract` argument."
     )
 
@@ -404,7 +402,7 @@ def get_dump_basename_and_format(dump):
     if dump_ext:
         return os.path.basename(dump)[: -len(dump_ext)], dump_ext
     elif os.path.isdir(dump):
-        return get_path_basename(dump), ""
+        return get_path_basename(dump), ".dump"
 
     return None, None
 
@@ -591,7 +589,7 @@ def get_logs(token, from_byte=0):
         token,
     )
     req = urlrequest.Request(request_url, headers={"Range": "bytes=%d-" % from_byte})
-    response = urlrequest.urlopen(req, timeout=REQUEST_TIMEOUT, context=ssl_context).read().decode("utf-8")
+    response = urlrequest.urlopen(req, timeout=REQUEST_TIMEOUT, context=ssl_context).read().decode("utf-8", "replace")
     return response
 
 
@@ -692,16 +690,21 @@ def pending_handler(fsm):
     Processing done in the 'pending' state.
     """
     token = fsm.get_context_data(("token",))
-
+    restore_db = not fsm.get_context_data(("no_restore",))
     is_pg_version_compatible = process_upgrade_request(token)
 
     # if the postgres version used for the upgrade is not compatible with the client postgres
     # version used to dump the database, deactivate the upgraded database restoring.
     if not is_pg_version_compatible:
-        logging.warning(
-            "Your postgres version is lower than the minimal required version to restore your upgraded database. "
-            "The upgraded dump will be downloaded but not restored."
+        log_message = (
+            "Your postgres version is lower than the minimal required version to restore your upgraded database."
         )
+
+        if restore_db:
+            log_message += " The upgraded dump will be downloaded but not restored."
+
+        logging.warning(log_message)
+
         fsm.update_context({"no_restore": True})
 
     return "progress"
@@ -728,12 +731,12 @@ def failed_handler(fsm):
 
     logging.error("The upgrade request has failed%s", ": %s" % reason if reason else "")
 
-    return None
+    return "terminal"
 
 
 def cancelled_handler(fsm):
     logging.info("The upgrade request has been cancelled")
-    return None
+    return "terminal"
 
 
 def done_handler(fsm):
@@ -790,7 +793,7 @@ def done_handler(fsm):
         restore_filestore(db_name, upgraded_db_name)
         clean_dump(info["dump_name"])
 
-    return None
+    return "terminal"
 
 
 # ---------------------------------------------------------------------------------
@@ -1036,7 +1039,7 @@ def get_env_vars(env_vars, env_file):
 
 
 def set_upgrade_and_data_server_names(host_uri):
-    global UPGRADE_SERVER_NAME, DATA_SERVER_NAME
+    global UPGRADE_SERVER_NAME, DATA_SERVER_NAME  # noqa: PLW0603
     UPGRADE_SERVER_NAME = "https://" + host_uri
     DATA_SERVER_NAME = host_uri
 
@@ -1128,7 +1131,9 @@ def process_upgrade_command(dbname, upgraded_db_name, dump, contract, target, ai
 
 def get_token_name(dump_absolute_path):
     input_file = (
-        os.path.join(dump_absolute_path, "toc.dat") if os.path.isdir(dump_absolute_path) else dump_absolute_path
+        os.path.join(dump_absolute_path, POSTGRES_TABLE_OF_CONTENTS)
+        if os.path.isdir(dump_absolute_path)
+        else dump_absolute_path
     )
 
     try:
