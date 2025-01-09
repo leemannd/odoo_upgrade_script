@@ -24,8 +24,32 @@ import time
 from datetime import datetime, timedelta
 from operator import itemgetter
 
-DEFAULT_SSH_KEY_NAME = os.path.join(tempfile.gettempdir(), "upgrade_ssh_key")
-KNOWN_HOSTS_NAME = os.path.join(tempfile.gettempdir(), "upgrade_known_hosts")
+try:
+    from shutil import which
+except ImportError:
+    from distutils.spawn import find_executable as which
+
+if sys.version_info[0] == 2:
+    input = raw_input  # noqa: A001, F821
+
+# Mapping each subcommand to its required external dependencies
+COMMAND_DEPENDENCIES = {
+    "log": {"ssh-keygen"},
+    "status": {"ssh-keygen"},
+    "restore": {"ssh-keygen", "rsync", "createdb", "pg_restore"},
+    "test": {"ssh-keygen", "rsync", "psql", "createdb", "pg_restore", "pg_dump"},
+    "production": {"ssh-keygen", "rsync", "psql", "createdb", "pg_restore", "pg_dump"},
+}
+
+# Mapping subcommand arguments to the dependencies they make unnecessary
+EXCLUDED_DEPENDENCIES = {
+    "no_restore": {"createdb", "pg_restore"},
+    "dump": {"pg_dump"},
+}
+
+UID = os.getuid()
+DEFAULT_SSH_KEY_NAME = os.path.join(tempfile.gettempdir(), "%s_upgrade_ssh_key" % UID)
+KNOWN_HOSTS_NAME = os.path.join(tempfile.gettempdir(), "%s_upgrade_known_hosts" % UID)
 
 UPGRADE_SERVER_NAME = os.environ.get("UPGRADE_SERVER_NAME", "https://upgrade.odoo.com")
 DATA_SERVER_NAME = os.environ.get("DATA_SERVER_NAME", "upgrade.odoo.com")
@@ -127,8 +151,26 @@ class StateMachine:
 # ---------------------------------------------------------------------------------
 
 
-def user_confirm():
-    return sys.stdin.read(1) not in ("n", "N")
+def user_confirm(negative_answer="n"):
+    return not input().lower().lstrip().startswith(negative_answer)
+
+
+def check_binaries_exist(args):
+    skip = set().union(
+        *(to_skip for arg_name, to_skip in EXCLUDED_DEPENDENCIES.items() if getattr(args, arg_name, False))
+    )
+    not_found = [cmd for cmd in COMMAND_DEPENDENCIES[args.command] - skip if not which(cmd)]
+    if not_found:
+        logging.error(
+            "It seems we cannot find some binaries needed for the requested action:\n"
+            "- %s\n\n"
+            "Please ensure they are present in your system, perhaps you need to install some packages.\n"
+            "If you wish you can continue, even though something may fail later. "
+            "Do you want to proceed? [y/N]",
+            "\n- ".join(not_found),
+        )
+        if user_confirm(negative_answer="y"):
+            sys.exit(1)
 
 
 def run_command(command, stream_output=False):
@@ -207,6 +249,7 @@ def upload_dump(dump_path, server, port, user, path, ssh_key, dest_dump_name=Non
                 "rsync",
                 "--chmod=u+rwx,g+rwx,o+r",
                 "--info=progress2",
+                "--delete-after",
                 "-are",
                 ssh,
                 dump_path,
@@ -289,19 +332,30 @@ def dump_database(db_name, dump_name, core_count):
 
     clean_dump(dump_name)
 
-    run_command(
-        [
-            "pg_dump",
-            "--no-owner",
-            "--format",
-            "d",
-            "--jobs",
-            str(core_count),
-            "--file",
-            dump_name,
-            db_name,
-        ]
-    )
+    try:
+        run_command(
+            [
+                "pg_dump",
+                "--no-owner",
+                "--format",
+                "d",
+                "--jobs",
+                str(core_count),
+                "--file",
+                dump_name,
+                db_name,
+            ]
+        )
+    except Exception as e:
+        logging.error(
+            "Generating the dump of your database has failed. %s\n"
+            "\nHint: ensure this script is run by the same system user running the Odoo process "
+            "(by default user 'odoo'), to avoid permission and operational issues. "
+            "The current user should have at least the necessary permissions to access "
+            "the Postgres database you are aiming to upgrade.",
+            e,
+        )
+        sys.exit(1)
 
 
 def restore_database(db_name, dump_name, core_count):
@@ -310,20 +364,32 @@ def restore_database(db_name, dump_name, core_count):
     """
     logging.info("Restore the dump file '%s' as the database '%s'", dump_name, db_name)
 
-    run_command(["createdb", db_name])
-    run_command(
-        [
-            "pg_restore",
-            "--no-owner",
-            "--format",
-            "d",
-            dump_name,
-            "--dbname",
+    try:
+        run_command(["createdb", db_name])
+        run_command(
+            [
+                "pg_restore",
+                "--no-owner",
+                "--format",
+                "d",
+                dump_name,
+                "--dbname",
+                db_name,
+                "--jobs",
+                str(core_count),
+            ]
+        )
+    except Exception as e:
+        logging.error(
+            "Restoring the upgraded database has failed:\n %s \n\n"
+            "You can run the following command to retry restoring the upgraded database yourself:\n"
+            "pg_restore --no-owner --format d --jobs %s --dbname %s %s",
+            e,
+            core_count,
             db_name,
-            "--jobs",
-            str(core_count),
-        ]
-    )
+            dump_name,
+        )
+        sys.exit(1)
 
 
 def restore_filestore(origin_db_name, upgraded_db_name):
@@ -346,8 +412,9 @@ def restore_filestore(origin_db_name, upgraded_db_name):
 
         logging.info("Merging the new filestore with the old one in %s ...", new_fs_path)
         shutil.copytree(origin_fs_path, new_fs_path)
-        run_command(["rsync", "-a", FILESTORE_NAME + os.sep, new_fs_path])
-        shutil.rmtree(FILESTORE_NAME)
+        if os.path.isdir(FILESTORE_NAME):
+            run_command(["rsync", "-a", FILESTORE_NAME + os.sep, new_fs_path])
+            shutil.rmtree(FILESTORE_NAME)
     else:
         logging.warning(
             "The original filestore of '%s' has not been found in %s. "
@@ -358,11 +425,20 @@ def restore_filestore(origin_db_name, upgraded_db_name):
 
 
 def clean_dump(dump_name):
-    if os.path.isdir(dump_name):
-        shutil.rmtree(dump_name)
+    try:
+        if os.path.isdir(dump_name):
+            shutil.rmtree(dump_name)
 
-    if os.path.isfile(dump_name):
-        os.remove(dump_name)
+        if os.path.isfile(dump_name):
+            os.remove(dump_name)
+    except PermissionError:
+        logging.error(
+            "Cleaning leftover dump has failed: the user executing the script does not have "
+            "enough permissions to remove the old dump, likely used for another upgrade request in the past. "
+            "Check ownership of '%s'.",
+            dump_name,
+        )
+        sys.exit(1)
 
 
 def get_db_contract(dbname, fallback_contract=None):
@@ -575,8 +651,16 @@ def store_known_hosts(known_hosts):
     Create a known_hosts file to be able to authenticate the rsync SSH server
     """
     known_hosts = known_hosts or ""
-    with open(KNOWN_HOSTS_NAME, "w") as f:
-        f.write(known_hosts)
+    try:
+        with open(KNOWN_HOSTS_NAME, "w") as f:
+            f.write(known_hosts)
+    except PermissionError:
+        logging.error(
+            "The current user is not the owner of the file '%s'.\n"
+            "Hint: in your next attempt, answer N when asked if you want to resume.",
+            KNOWN_HOSTS_NAME,
+        )
+        sys.exit(1)
 
 
 def get_logs(token, from_byte=0):
@@ -606,7 +690,7 @@ def get_request_status(token):
         ),
     )
 
-    return response["status"], response["host_uri"], response.get("reason")
+    return response["status"], response["host_uri"], response.get("reason"), response.get("archived")
 
 
 # ---------------------------------------------------------------------------------
@@ -849,14 +933,14 @@ def monitor_request_processing(token):
     """
     Monitor the request processing status and display logs at the same time
     """
-    status, host_uri, reason = get_request_status(token)
+    status, _, reason = get_request_status(token)[:3]
     displayed_log_bytes = 0
     last_check_time = datetime.now()
 
     while status in ("progress", "pending"):
         # status monitoring
         if datetime.now() > last_check_time + timedelta(seconds=STATUS_MONITORING_PERIOD):
-            status, host_uri, reason = get_request_status(token)
+            status, _, reason = get_request_status(token)[:3]
             last_check_time = datetime.now()
 
         # logs streaming
@@ -877,21 +961,23 @@ def parse_command_line():
     """
 
     def add_upgrade_arguments(subparser):
-        subparser.add_argument(
+        dbname_or_dump = subparser.add_mutually_exclusive_group(required=True)
+        dbname_or_dump.add_argument(
             "-d",
             "--dbname",
             help="The name of a database to dump and upgrade",
         )
-        subparser.add_argument(
-            "-r",
-            "--restore-name",
-            help="The name of database into which the upgraded dump must be restored",
-        )
-        subparser.add_argument(
+        dbname_or_dump.add_argument(
             "-i",
             "--dump",
             help="The database dump to upgrade (.sql, .dump, .sql.gz, .zip or a psql dump directory with %s file)"
             % POSTGRES_TABLE_OF_CONTENTS,
+        )
+
+        subparser.add_argument(
+            "-r",
+            "--restore-name",
+            help="The new name of the local database into which the upgraded dump will be restored. Do not create it manually, it will be done automatically.",
         )
         subparser.add_argument(
             "-c",
@@ -956,8 +1042,14 @@ def parse_command_line():
 
     prog = "python <(curl -s https://upgrade.odoo.com/upgrade)" if not os.path.isfile(sys.argv[0]) else None
 
-    parser = argparse.ArgumentParser(prog=prog)
-
+    parser = argparse.ArgumentParser(
+        prog=prog,
+        epilog=(
+            "Some options require access rights to connect to a database and generate a dump.\n"
+            "Make sure that you are running this script with the correct user.\n"
+            "Running as root is not advised."
+        ),
+    )
     parser.add_argument("--debug", action="store_true", help="activate debug traces")
 
     subparsers = parser.add_subparsers(dest="command")
@@ -1015,12 +1107,8 @@ def parse_command_line():
 
     args = parser.parse_args()
 
-    if args.command in ("test", "production"):
-        if not args.dbname and not args.dump:
-            parser.error("At least a --dbname or --dump must be provided")
-
-        if args.dump and not args.contract:
-            parser.error("A contract number must be provided when the --dump argument is used")
+    if args.command in ("test", "production") and args.dump and not args.contract:
+        parser.error("A contract number must be provided when the --dump argument is used")
 
     return args
 
@@ -1033,7 +1121,7 @@ def get_env_vars(env_vars, env_file):
         env_vars.extend(line.strip() for line in env_file if line and line[0] != "#")
     # Check that args are correctly formatted in the form VAR=VAL
     for var in env_vars:
-        if not re.match(r"^\w+=\w+$", var):
+        if not re.match(r"^\w+=", var):
             raise ValueError("The following environment variable option is badly formatted: %s" % var)
     return env_vars
 
@@ -1045,9 +1133,6 @@ def set_upgrade_and_data_server_names(host_uri):
 
 
 def process_upgrade_command(dbname, upgraded_db_name, dump, contract, target, aim, env_vars):
-    if dbname and dump:
-        raise UpgradeError("You cannot upgrade a database and a dump file at the same time")
-
     start_state = "init"
     additional_context = {
         "target": target,
@@ -1107,18 +1192,20 @@ def process_upgrade_command(dbname, upgraded_db_name, dump, contract, target, ai
     saved_token = get_saved_token(token_name, target, aim)
 
     if saved_token is not None:
-        logging.info("This upgrade request seems to have been interrupted. Do you want to resume it ? [Y/n]")
-        if user_confirm():
-            logging.info("Resuming the upgrade request")
+        req_state, host_uri, reason, archived = get_request_status(saved_token)
+        if not archived:
+            logging.info("This upgrade request seems to have been interrupted. Do you want to resume it? [Y/n]")
+            if user_confirm():
+                logging.info("Resuming the upgrade request")
 
-            start_state, host_uri, reason = get_request_status(saved_token)
-            additional_context.update({"token": saved_token, "reason": reason})
+                start_state = req_state
+                additional_context.update({"token": saved_token, "reason": reason})
 
-            # make sure that the request is resumed from the correct node
-            set_upgrade_and_data_server_names(host_uri)
-            fsm.update_context({"data_server_name": DATA_SERVER_NAME})
-        else:
-            logging.info("Restarting the upgrade request from the beginning")
+                # make sure that the request is resumed from the correct node
+                set_upgrade_and_data_server_names(host_uri)
+                fsm.update_context({"data_server_name": DATA_SERVER_NAME})
+            else:
+                logging.info("Restarting the upgrade request from the beginning")
 
     # run the upgrade
     fsm.run(start_state, additional_context)
@@ -1154,7 +1241,7 @@ def get_token_name(dump_absolute_path):
 
 
 def process_restore_command(token, dbname, aim, restored_name):
-    status, host_uri, _ = get_request_status(token)
+    status, host_uri = get_request_status(token)[:2]
     set_upgrade_and_data_server_names(host_uri)
     fsm.update_context({"data_server_name": DATA_SERVER_NAME})
     if status == "done":
@@ -1171,12 +1258,12 @@ def process_restore_command(token, dbname, aim, restored_name):
 
 
 def process_status_command(token):
-    status, _, reason = get_request_status(token)
+    status, _, reason = get_request_status(token)[:3]
     logging.info("Request status: %s%s", status.upper(), " (%s)" % reason if reason else "")
 
 
 def process_log_command(token, from_byte):
-    _, host_uri, _ = get_request_status(token)
+    host_uri = get_request_status(token)[1]
     set_upgrade_and_data_server_names(host_uri)
     fsm.update_context({"data_server_name": DATA_SERVER_NAME})
     logs = get_logs(token, from_byte)
@@ -1186,6 +1273,37 @@ def process_log_command(token, from_byte):
 
 def main():
     args = parse_command_line()
+
+    # configure loggers
+    log_level = logging.DEBUG if args.debug else logging.INFO
+    logging.basicConfig(
+        format="%(asctime)s %(levelname)s: %(message)s",
+        datefmt="%Y-%m-%d %I:%M:%S",
+        level=log_level,
+    )
+
+    check_binaries_exist(args)
+
+    if "restore_name" in args and args.restore_name:
+        output = subprocess.check_output(
+            [
+                "psql",
+                "postgres",
+                "--no-psqlrc",
+                "--tuples-only",
+                "--csv",
+                "--command",
+                "SELECT datname FROM pg_database",
+            ],
+        )
+        if any(localdb == args.restore_name for localdb in output.decode("utf-8", "ignore").splitlines()):
+            logging.error(
+                "Refusing to restore the dump into DB '%s' since it already exists.\n"
+                "This script will only restore the upgraded dump into a new DB.\n"
+                "You can rerun it providing a name that doesn't collide with an already existing DB. This script will create the DB for you.\n",
+                args.restore_name,
+            )
+            sys.exit(1)
 
     if "dump" in args and args.dump:
         dump_absolute_path = os.path.abspath(args.dump)
@@ -1205,14 +1323,6 @@ def main():
         host_dump_upload_path = "."
         host_dump_download_path = "."
 
-    # configure loggers
-    log_level = logging.DEBUG if args.debug else logging.INFO
-    logging.basicConfig(
-        format="%(asctime)s %(levelname)s: %(message)s",
-        datefmt="%Y-%m-%d %I:%M:%S",
-        level=log_level,
-    )
-
     # define state machine and internal context
     fsm.set_states(
         {
@@ -1228,6 +1338,20 @@ def main():
 
     # handle parameters specific to some commands
     if args.command in ("test", "production", "restore"):
+        if os.path.isfile(args.ssh_key):
+            try:
+                run_command(["ssh-keygen", "-y", "-f", args.ssh_key])
+            except UpgradeError as e:
+                logging.error(
+                    "The current user is not able to use the SSH key file '%s'.\nError: %s\n"
+                    "Hint: each upgrade request is associated with a SSH key. If the key is lost, this\n"
+                    "script will create another one, but you will have to request a new upgrade.\n"
+                    "In such case, if asked to resume the upgrade, answer 'n'.",
+                    args.ssh_key,
+                    e,
+                )
+                sys.exit(1)
+
         fsm.update_context(
             {
                 "ssh_key": args.ssh_key,
